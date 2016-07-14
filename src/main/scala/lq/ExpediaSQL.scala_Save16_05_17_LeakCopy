@@ -1,0 +1,430 @@
+package lq
+
+import java.lang._ 
+import scala.reflect.runtime.universe.TypeTag
+import scala.reflect.runtime.universe.TypeTag._
+import scala.collection.mutable.ArrayBuffer
+import scala.concurrent.duration._
+import scala.concurrent._
+
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkContext._
+import org.apache.spark.SparkConf
+import org.apache.spark.sql._
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.expressions.Window
+//import org.apache.spark.sql.hive.HiveContext
+
+import org.apache.spark.ml.classification.{OneVsRest, LogisticRegression}
+import org.apache.spark.ml.param.ParamMap
+import org.apache.spark.mllib.linalg._
+import org.apache.spark.mllib.clustering._
+import org.apache.spark.mllib.random._
+
+import org.apache.spark.ml._
+import org.apache.spark.ml.classification._
+import org.apache.spark.ml.feature._
+import org.apache.spark.ml.evaluation._
+
+import java.lang.Math
+import java.text.SimpleDateFormat
+import java.util.concurrent.TimeUnit
+import java.util.{Calendar, Date}
+
+/*
+date_time Timestamp string 
+site_name ID of the Expedia point of sale (i.e. Expedia.com, Expedia.co.uk, Expedia.co.jp, ...) int 
+posa_continent ID of continent associated with site_name int 
+user_location_country The ID of the country the customer is located int 
+user_location_region The ID of the region the customer is located int 
+user_location_city The ID of the city the customer is located int 
+orig_destination_distance Physical distance between a hotel and a customer at the time of search. A null means the distance could not be calculated double 
+user_id ID of user int 
+is_mobile 1 when a user connected from a mobile device, 0 otherwise tinyint 
+is_package 1 if the click/booking was generated as a part of a package (i.e. combined with a flight), 0 otherwise int 
+channel ID of a marketing channel int 
+srch_ci Checkin date string 
+srch_co Checkout date string 
+srch_adults_cnt The number of adults specified in the hotel room int 
+srch_children_cnt The number of (extra occupancy) children specified in the hotel room int 
+srch_rm_cnt The number of hotel rooms specified in the search int 
+srch_destination_id ID of the destination where the hotel search was performed int 
+srch_destination_type_id Type of destination int 
+is_booking 1 if a booking, 0 if a click tinyint 
+cnt Numer of similar events in the context of the same user session bigint 
+hotel_continent Hotel continent int 
+hotel_country Hotel country int 
+hotel_market Hotel market int 
+hotel_cluster ID of a hotel cluster int 
+*/
+
+
+
+object ExpediaSQL {
+
+def getyear(s:String):Int = {
+   val formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+   var date = formatter.parse(s);
+   val calendar = Calendar.getInstance();
+   calendar.setTime(date);
+   calendar.get(Calendar.YEAR) % 100;
+}
+
+def getNDays(ci:String, co:String):Int = {
+   try{
+      val formatter = new SimpleDateFormat("yyyy-MM-dd");
+      var dateCI = formatter.parse(ci);
+      var dateCO = formatter.parse(co);
+      return TimeUnit.DAYS.convert(dateCO.getTime()-dateCI.getTime(), TimeUnit.MILLISECONDS).toInt
+   }catch{
+      case unknown : Throwable => return -99
+   }
+}
+
+
+//  case class trainClass(date_time:String , site_name:Int , posa_continent:Int , user_location_country:Int , user_location_region:Int , user_location_city:Int , orig_destination_distance:Double , user_id:Int , is_mobile:Int , is_package:Int , channel:Int , srch_ci:String , srch_co:String , srch_adults_cnt:Int , srch_children_cnt:Int , srch_rm_cnt:Int , srch_destination_id:Int , srch_destination_type_id:Int , is_booking:Int , cnt:Int , hotel_continent:Int , hotel_country:Int , hotel_market:Int , hotel_cluster:Int)
+
+  //simple functio which prints all the stat
+  def printStat(sqlContext:org.apache.spark.sql.SQLContext, input:org.apache.spark.sql.DataFrame, table:String){
+      input.describe().show() //take quite some time
+      sqlContext.sql("SELECT orig_destination_distance FROM " + table + " WHERE orig_destination_distance>=0").describe().show()
+      //input.select(mean("posa_continent"), min("posa_continent"), max("posa_continent")).show()
+  }
+
+  def printCorrMatrix(sqlContext:org.apache.spark.sql.SQLContext, input:org.apache.spark.sql.DataFrame){
+        val ColType = input.dtypes
+        ColType.foreach(println)
+        val NumCol = ArrayBuffer[String]()
+        for(ct <- ColType){
+           println(ct)
+           if(! ct._2.contains("String")){
+              NumCol+= ct._1 
+           }           
+        }
+        NumCol.foreach(println)
+
+        print("%20s".format("Header"))
+        for(c1 <- NumCol){
+           print(" | %20s".format(c1))
+        }
+        println(" |")
+        for(c1 <- NumCol){
+           print("%20s".format(c1))
+           for(c2 <- NumCol){
+              print("%+20.5f".format(input.stat.corr(c1, c2) ))
+           }
+           println(" |")
+        }
+   }
+
+//use of future function
+//    val futureRDDHotelLoc = sqlContext.sql("SELECT hotel_country, hotel_cluster, count(date_time) as count FROM trainDF GROUP BY hotel_country, hotel_cluster ORDER BY count DESC").map(row => (row.getInt(0), row.getInt(1), row.getLong(2)) ).collectAsync()
+//    val lookupHotelLoc = sc.broadcast(Await.result(futureRDDHotelLoc, 10 seconds).toSeq )
+
+
+
+  def main(args: Array[String]) {
+        val conf = new SparkConf()
+        conf.setAppName("ExpediaSQL")
+        conf.set("spark.driver.memory", "4g")
+        conf.set("spark.executor.memory", "4g")
+        val sc = new SparkContext(conf)
+        sc.setLogLevel("WARN")
+
+        val sqlContext = new org.apache.spark.sql.SQLContext(sc)
+        import sqlContext.implicits._
+
+        case class user_location(country:Int , region:Int , city:Int)
+        case class hotel_location(continent:Int , country:Int , market:Int);
+        case class cico_date(ci:String , co:String)
+        case class querry(id:Long, date_time:String , site_name:Int , posa_continent:Int , user:user_location, orig_destination_distance:Int , user_id:Int , is_mobile:Int , is_package:Int , channel:Int , date:cico_date, srch_adults_cnt:Int , srch_children_cnt:Int , srch_rm_cnt:Int , srch_destination_id:Int , srch_destination_type_id:Int , is_booking:Int , cnt:Int , hotel:hotel_location, hotel_cluster:Int)
+        case class result(q:querry, p:Seq[Int])
+
+        //OPTIONS
+        val EvaluatePerf = false;
+
+ 	//Loading the train data into RDD with split
+	val inputTrainDataRowRDD =sc.textFile("file:///afs/cern.ch/user/q/querten/workspace/public/SparkTest/Data/train.csv", 380).filter(! _.contains("date_time") ).map(_.split(",")).zipWithIndex().map( pair => {
+           val a = pair._1
+           val index = pair._2
+           var distance:Int = {if(a(6).length>0){(a(6).toDouble*1E5).toInt}else{-1} }
+           querry(-1*index, a(0),a(1).toInt,a(2).toInt, user_location(a(3).toInt,a(4).toInt,a(5).toInt),distance,a(7).toInt,a(8).toInt,a(9).toInt,a(10).toInt, cico_date(a(11),a(12)) , a(13).toInt, a(14).toInt, a(15).toInt, a(16).toInt, a(17).toInt, a(18).toInt, a(19).toInt, hotel_location(a(20).toInt, a(21).toInt, a(22).toInt), a(23).toInt )
+        })//.sample(true, 0.01)
+
+ 	//Loading the test data into RDD with split
+	val inputTestDataRowRDD =sc.textFile("file:///afs/cern.ch/user/q/querten/scratch0/test.csv", 380).filter(! _.contains("date_time") ).map(_.split(",")).map( a => {
+           var distance:Int = {if(a(7).length>0){(a(7).toDouble*1E5).toInt}else{-1} }
+           querry(a(0).toLong, a(1),a(2).toInt,a(3).toInt,user_location(a(4).toInt,a(5).toInt,a(6).toInt),distance,a(8).toInt,a(9).toInt,a(10).toInt,a(11).toInt,cico_date(a(12),a(13)), a(14).toInt, a(15).toInt, a(16).toInt, a(17).toInt, a(18).toInt, 1, 1, hotel_location(a(19).toInt, a(20).toInt, a(21).toInt), -1 )
+        })
+        
+
+        //define the training and test samples that we are going to use
+        val Array(trainDataRowRDD, testDataRowRDD) = {
+           if(EvaluatePerf){
+              val tmp = inputTrainDataRowRDD.randomSplit(Array(0.95, 0.05), 1234)
+              Array(tmp(0), tmp(1).filter(a => a.is_booking==1 && a.cnt==1) )
+           }else{
+              Array(inputTrainDataRowRDD, inputTestDataRowRDD )
+           }
+        }.map(_.cache())
+
+        //Init : DEFINE THE OUTPUT FORMAT AND USE IT EVERYWHERE  (ALLOWS to comment some part of the code without hurts)
+        val totalstartTime = System.nanoTime()
+        var results = testDataRowRDD.map(q => result(q, Seq[Int]()) );
+
+        //Step a) : MAKE PREDICTION BASED ON DISTANCE DATA LEAK
+        val leakRDD = trainDataRowRDD
+        .filter(q => q.orig_destination_distance >=0 )
+        .map(q => ( (q.user.city, q.orig_destination_distance, q.hotel_cluster) , 1)  )
+        .reduceByKey(_+_)
+        .map( pair => {val key = pair._1; val value=pair._2; ((key._1, key._2) , Seq( (key._3, value) ) ) })
+        .reduceByKey((a,b) => a++b )
+        .mapValues( a => a.sortWith(_._2 > _._2).map(_._1)  )
+
+        results = results.filter(r=>r.q.orig_destination_distance<0) ++ results.filter(r=>r.q.orig_destination_distance>=0)
+        .map(r => ( (r.q.user.city, r.q.orig_destination_distance), r)  )
+        .cogroup(leakRDD)
+        .flatMap( in => {
+           val key = in._1
+           var test = in._2._1
+           val leak = in._2._2
+
+           if(key._2>=0 && leak.size>0){                                                                       //make sure we have a leak AND the distance is >0 
+              test.map(r => result(r.q, r.p ++ leak.head) ) 
+           }else{ 
+              test 
+           }
+        })
+
+
+        //Step b) : MAKE PREDICTION BASED ON MOST FREQUENT CLUSTER AT DESTINATION
+        //b1- get the most probable cluster per destinationId/market
+        val hotelLocRDD1 = trainDataRowRDD                                                                     //WILL BE  PairRDD[DestId , Map[Marker , Top5clusters]  ]
+        .filter( q => getyear(q.date_time)==14)
+        .map(q => ( (q.srch_destination_id, (q.hotel.country,q.hotel.market), q.hotel_cluster) ,  {if(q.is_booking==1)1.0 else 0.15})  )                           //group by destId/(country/market)/cluster
+        .reduceByKey(_+_)                                                                                      //count per group
+        .map( pair => {val key = pair._1; val value=pair._2; ((key._1, key._2) , Seq( (key._3, value) ) ) })   //regroup by DestId/market
+        .reduceByKey((a,b) => a++b )                                                                           //sum-up the list for each group
+        .mapValues( a => a.sortWith(_._2 > _._2).map(_._1)  )                                          //collapste various clusters to a list
+        .map( pair => {val key = pair._1; val value=pair._2; ( key._1, Map(key._2 -> value) ) })               //regroup by DestId
+        .reduceByKey((a,b) => a++b )                                                                           //sum-up the list for each group
+
+        //b2) get the mist probable cluster per destId (assign to them marker=-1)
+        val hotelLocRDD2 = trainDataRowRDD                                                                     //WILL BE  PairRDD[DestId , Map[-1, Top5clusters]  ]
+        .map(q => ( (q.srch_destination_id, q.hotel_cluster) , {if(q.is_booking==1)1.0 else 0.15})  )         //group by destId/market/cluster
+        .reduceByKey(_+_)                                                                                      //count per group
+        .map( pair => {val key = pair._1; val value=pair._2; (key._1, Seq( (key._2, value) ) ) })              //regroup by DestId/market
+        .reduceByKey((a,b) => a++b )                                                                           //sum-up the list for each group
+        .mapValues( a => a.sortWith(_._2 > _._2).map(_._1)  )                                          //collapste various clusters to a list
+        .map( pair => {val key = pair._1; val value=pair._2; ( key,    Map((-1,-1) -> value) ) })                   //align to the destId/Map(channel -> top5) format
+        .reduceByKey((a,b) => a++b )                                                                           //sum-up the list for each group
+ 
+        //b3) merge the two datasets
+        val hotelLocRDD = (hotelLocRDD1++hotelLocRDD2).reduceByKey((a,b) => a++b )
+ 
+        println("Destination Id with more than 1 channel = " + hotelLocRDD1.filter( a => a._2.size>1).count() )
+
+        //b4) make the prediction
+        results = results
+        .map(r => ( r.q.srch_destination_id, r)  )
+        .cogroup(hotelLocRDD)
+        .flatMap( in => {
+           val key = in._1     //hotel location
+           var test = in._2._1 //matching querry data
+           val lookup = in._2._2 //matching hotel location mapping best clusters
+
+           if(lookup.size>0){  //make sure this destId is in the lookup table
+              test.map(r => {
+                 var prediction = lookup.head.getOrElse((r.q.hotel.country,r.q.hotel.market), Seq[Int]())
+                 if(prediction.size<5){ prediction= prediction ++ lookup.head.getOrElse((-1,-1), Seq[Int]()) }
+                 result(r.q, (r.p ++ prediction).distinct ) 
+              }) 
+           }else{ 
+              test 
+           }
+        })
+
+
+
+        //Step c) : MAKE PREDICTION BASED ON MOST FREQUENT CLUSTER AT DESTINATION COUNTRY
+        //c1) get the most probable cluster for this country
+        val hotelCountryRDD = trainDataRowRDD                                                                  //WILL BE  PairRDD[Country , Top5clusters  ]
+        .map(q => ( (q.hotel.country, q.hotel_cluster) , {if(q.is_booking==1)1.0 else 0.167})  )               //group by country/cluster
+        .reduceByKey(_+_)                                                                                      //count per group
+        .map( pair => {val key = pair._1; val value=pair._2; (key._1, Seq( (key._2, value) ) ) })              //regroup by country/market
+        .reduceByKey((a,b) => a++b )                                                                           //sum-up the list for each group
+        .mapValues( a => a.sortWith(_._2 > _._2).map(_._1)  )                                          //collapste various clusters to a list
+ 
+        //c2) make the prediction
+        results = results
+        .map(r => ( r.q.hotel.country, r)  )
+        .cogroup(hotelCountryRDD)
+        .flatMap( in => {
+           val key = in._1     //hotel location
+           var test = in._2._1 //matching querry data
+           val lookup = in._2._2 //matching hotel location mapping best clusters
+
+           if(lookup.size>0){  //make sure this country is in the lookup table
+              test.map(r => result(r.q, (r.p ++ lookup.head).distinct.take(5) ) ) 
+           }else{ 
+              test 
+           }
+        })
+
+
+
+        //Step d) : MAKE PREDICTION BASED ON MOST FREQUENT CLUSTER WHERE EVER
+        //d1) get the most probable cluster for this country
+        val mostFrequentClusters = trainDataRowRDD                                                          //WILL BE  PairRDD[cluster]
+        .map(q => ( q.hotel_cluster, 1)  )                                   //group by cluster
+        .reduceByKey(_+_)                                                                                      //count per cluster
+        .sortBy(_._2, false)                                                                                   //order the list (descending)
+        .take(10).map(_._1).toSeq                                                                                    //keep the 5 most clusters
+ 
+        //d2) make the prediction
+        results = results.filter(r=>r.p.size>=5)++results.filter(r=>r.p.size<5)
+        .map(r => result(r.q, (r.p ++ mostFrequentClusters).distinct.take(5) ) ) 
+
+
+
+
+    //some statistics
+    println("total test sample = " + results.count() )
+    println("Test Id with less than 5 predictions = " + results.filter( r => r.p.size<5).count() )
+    println("Test Id with           0 predictions = " + results.filter( r => r.p.size<=0).count() )
+    println("Test Id with           1 predictions = " + results.filter( r => r.p.size==1).count() )
+    println("Test Id with           2 predictions = " + results.filter( r => r.p.size==2).count() )
+    println("Test Id with           3 predictions = " + results.filter( r => r.p.size==3).count() )
+    println("Test Id with           4 predictions = " + results.filter( r => r.p.size==4).count() )
+    println("Test Id with           5 predictions = " + results.filter( r => r.p.size==5).count() )
+
+
+
+
+    //Step FINAL): evaluate performance using map(5) function OR simply save the results for submission
+    if(EvaluatePerf){
+       results.take(250).foreach(println)
+
+       val N = results.count()
+       val Sum = results.map( r => {
+          val Truth = r.q.hotel_cluster
+          val Top5 = r.p
+          Top5.view.zipWithIndex.map( p => if(p._1==Truth){1.toDouble/(p._2+1.0)}else{0.0} ).foldLeft(0.toDouble)(Math.max) 
+       }).sum()
+       println("Performance N = " + N )
+       println("Performance Sum = " + Sum )
+       println("Performance with MAP@5 = " + (Sum/N).toString() )
+    }else{
+       val submission = results
+       .map( r => r.q.id.toString + "," + r.p.mkString(" ") )
+       .coalesce(10)
+       .saveAsTextFile("file:///afs/cern.ch/user/q/querten/scratch0/Expedia_16_05_14");
+    }
+
+    val totalelapsedTime = (System.nanoTime() - totalstartTime) / 1e9
+    System.err.println(s"TOTAL time: $totalelapsedTime seconds")
+
+
+
+
+/*
+    val lookupCountryDist = sc.broadcast(
+       trainDF.select($"user_location_city", $"orig_destination_distance", $"hotel_cluster" )
+       .where($"orig_destination_distance">=0)
+       .groupBy("user_location_city", "orig_destination_distance", "hotel_cluster")
+       .count()
+       .orderBy($"count".desc)
+       .map(row => ( (row.getInt(0), row.getInt(1)) , Seq((row.getInt(2),row.getLong(3))) ) )
+       .reduceByKey((a,b) => a++b )
+       .mapValues( a => a.sortWith(_._2 > _._2).take(5).map(_._1)  )
+       .collectAsMap()
+    )
+
+
+    val grouped =  trainDF.select($"srch_destination_id", $"hotel_country", $"hotel_market", $"hotel_cluster" )
+    .groupBy("srch_destination_id", "hotel_country", "hotel_market", "hotel_cluster")
+    .count()
+    .orderBy($"count".desc)
+
+    val lookupDestMarketLoc = sc.broadcast(
+       grouped
+       .map(row => ( (row.getAs[Int]("srch_destination_id"), row.getAs[Int]("hotel_country"), row.getAs[Int]("hotel_market")), Seq((row.getInt(3), row.getLong(4)) ) ) )
+       .reduceByKey((a,b) => a++b )
+       .mapValues( a => a.sortWith(_._2 > _._2).take(10).map(_._1)  )
+       .collectAsMap()
+     )
+
+    val lookupDestLoc = sc.broadcast(
+       grouped
+       .groupBy("srch_destination_id", "hotel_country", "hotel_cluster")
+       .count()
+       .orderBy($"count".desc)
+       .map(row => (row.getInt(0), Seq((row.getInt(1), row.getInt(2))) ) )
+       .reduceByKey((a,b) => a++b )
+       .mapValues( a => a.sortWith(_._2 > _._2).take(10).map(_._1)  )
+       .collectAsMap()
+     )
+
+    val lookupDestCountry = sc.broadcast(
+       grouped
+       .groupBy("hotel_country", "hotel_cluster")
+       .count()
+       .orderBy($"count".desc)
+       .map(row => (row.getInt(0), Seq((row.getInt(1), row.getLong(2))) ) )
+       .reduceByKey((a,b) => a++b )
+       .mapValues( a => a.sortWith(_._2 > _._2).take(10).map(_._1)  )
+       .collectAsMap()
+     )
+
+
+    val totalstartTime = System.nanoTime()
+    val finalPrediction = testDF.map(row => {
+       val testId = row.getLong(0)
+       val testUCountry = row.getInt(4)
+       val testURegion = row.getInt(5)
+       val testUCity = row.getInt(6)
+       val testDist = row.getInt(7)
+       val testDestId =  row.getInt(17)
+       val testDestContinent = row.getInt(21)
+       val testDestCountry = row.getInt(22)
+       val testDestMarket = row.getInt(23)
+       val testTrueHotelCluster = row.getInt(24)
+
+
+       var Top5 =  Seq[Int]()
+
+//        if(testDist != -1){Top5 = Top5 ++ lookupCountryDist  .value.getOrElse( (testUCountry,testURegion,testUCity,testDist), Seq[Int]() )  } //data leak
+        if(testDist != -1){Top5 = Top5 ++ lookupCountryDist  .value.getOrElse( (testUCity,testDist), Seq[Int]() )  } //data leak
+        if(Top5.size<5){ Top5 = Top5 ++ lookupDestMarketLoc.value.getOrElse( (testDestId, testDestCountry, testDestMarket), Seq[Int]() ).distinct } //most frequent @ (destId, Market)
+        if(Top5.size<5){ Top5 = Top5 ++ lookupDestLoc      .value.getOrElse(  testDestId                 , Seq[Int]() ).distinct } //most frequent @ (destId)
+        if(Top5.size<5){ Top5 = Top5 ++ lookupDestCountry  .value.getOrElse(  testDestCountry            , Seq[Int]() ).distinct } //most frequent @ country
+
+       (testId, testTrueHotelCluster, Top5.take(5) )
+    })
+
+
+    //evaluate performance using map(5) function OR simply save the results for submission
+    if(EvaluatePerf){
+       finalPrediction.take(25).foreach(println)
+
+       val N = finalPrediction.count()
+       val Sum = finalPrediction.map( a => {
+          val Truth = a._2
+          val Top5 = a._3
+          Top5.view.zipWithIndex.map( p => if(p._1==Truth){1.toDouble/(p._2+1.0)}else{0.0} ).foldLeft(0.toDouble)(Math.max) 
+       }).sum()
+       println("Performance N = " + N )
+       println("Performance Sum = " + Sum )
+       println("Performance with MAP@5 = " + (Sum/N).toString() )
+    }else{
+       val results = finalPrediction.map( pair => pair._1.toString + "," + pair._3.mkString(" ") )
+       results.coalesce(10).saveAsTextFile("file:///afs/cern.ch/user/q/querten/scratch0/Expedia_16_05_14");
+    }
+
+
+    val totalelapsedTime = (System.nanoTime() - totalstartTime) / 1e9
+    System.err.println(s"TOTAL time: $totalelapsedTime seconds")
+*/
+  }
+}

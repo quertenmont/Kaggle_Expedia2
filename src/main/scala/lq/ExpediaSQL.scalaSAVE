@@ -1,0 +1,246 @@
+package lq
+
+import java.lang._ 
+import scala.reflect.runtime.universe.TypeTag
+import scala.reflect.runtime.universe.TypeTag._
+import scala.collection.mutable.ArrayBuffer
+
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkContext._
+import org.apache.spark.SparkConf
+import org.apache.spark.sql._
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.functions.udf
+import org.apache.spark.sql.types._
+           
+
+import org.apache.spark.ml.classification.{OneVsRest, LogisticRegression}
+import org.apache.spark.ml.param.ParamMap
+import org.apache.spark.mllib.linalg._
+import org.apache.spark.mllib.clustering._
+import org.apache.spark.mllib.random._
+import org.apache.spark.mllib.random.RandomRDDs
+
+
+import org.apache.spark.ml.Pipeline
+import org.apache.spark.ml.classification.DecisionTreeClassifier
+import org.apache.spark.ml.classification.DecisionTreeClassificationModel
+import org.apache.spark.ml.feature._
+import org.apache.spark.ml.Estimator
+import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
+import org.apache.spark.ml.classification.MultilayerPerceptronClassifier 
+import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator 
+import org.apache.spark.ml.classification.{RandomForestClassificationModel, RandomForestClassifier}
+import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
+
+import java.lang.Math
+import java.util.Date;
+import java.text.SimpleDateFormat
+import java.util.concurrent.TimeUnit
+
+/*
+date_time Timestamp string 
+site_name ID of the Expedia point of sale (i.e. Expedia.com, Expedia.co.uk, Expedia.co.jp, ...) int 
+posa_continent ID of continent associated with site_name int 
+user_location_country The ID of the country the customer is located int 
+user_location_region The ID of the region the customer is located int 
+user_location_city The ID of the city the customer is located int 
+orig_destination_distance Physical distance between a hotel and a customer at the time of search. A null means the distance could not be calculated double 
+user_id ID of user int 
+is_mobile 1 when a user connected from a mobile device, 0 otherwise tinyint 
+is_package 1 if the click/booking was generated as a part of a package (i.e. combined with a flight), 0 otherwise int 
+channel ID of a marketing channel int 
+srch_ci Checkin date string 
+srch_co Checkout date string 
+srch_adults_cnt The number of adults specified in the hotel room int 
+srch_children_cnt The number of (extra occupancy) children specified in the hotel room int 
+srch_rm_cnt The number of hotel rooms specified in the search int 
+srch_destination_id ID of the destination where the hotel search was performed int 
+srch_destination_type_id Type of destination int 
+is_booking 1 if a booking, 0 if a click tinyint 
+cnt Numer of similar events in the context of the same user session bigint 
+hotel_continent Hotel continent int 
+hotel_country Hotel country int 
+hotel_market Hotel market int 
+hotel_cluster ID of a hotel cluster int 
+*/
+
+
+
+object ExpediaSQL {
+
+def getyear(s:String):String = {
+   val year = s.substring(s.lastIndexOf('/')+1)
+   year
+}
+
+def getNDays(ci:String, co:String):Int = {
+   try{
+      val formatter = new SimpleDateFormat("yyyy-MM-dd");
+      var dateCI = formatter.parse(ci);
+      var dateCO = formatter.parse(co);
+      return TimeUnit.DAYS.convert(dateCO.getTime()-dateCI.getTime(), TimeUnit.MILLISECONDS).toInt
+   }catch{
+      case unknown : Throwable => return -99
+   }
+}
+
+
+//  case class trainClass(date_time:String , site_name:Int , posa_continent:Int , user_location_country:Int , user_location_region:Int , user_location_city:Int , orig_destination_distance:Double , user_id:Int , is_mobile:Int , is_package:Int , channel:Int , srch_ci:String , srch_co:String , srch_adults_cnt:Int , srch_children_cnt:Int , srch_rm_cnt:Int , srch_destination_id:Int , srch_destination_type_id:Int , is_booking:Int , cnt:Int , hotel_continent:Int , hotel_country:Int , hotel_market:Int , hotel_cluster:Int)
+
+  //simple functio which prints all the stat
+  def printStat(sqlContext:org.apache.spark.sql.SQLContext, input:org.apache.spark.sql.DataFrame, table:String){
+      input.describe().show() //take quite some time
+      sqlContext.sql("SELECT orig_destination_distance FROM " + table + " WHERE orig_destination_distance>=0").describe().show()
+      //input.select(mean("posa_continent"), min("posa_continent"), max("posa_continent")).show()
+
+  }
+
+  def printCorrMatrix(sqlContext:org.apache.spark.sql.SQLContext, input:org.apache.spark.sql.DataFrame){
+        val ColType = input.dtypes
+        ColType.foreach(println)
+        val NumCol = ArrayBuffer[String]()
+        for(ct <- ColType){
+           println(ct)
+           if(! ct._2.contains("String")){
+              NumCol+= ct._1 
+           }           
+        }
+        NumCol.foreach(println)
+
+        print("%20s".format("Header"))
+        for(c1 <- NumCol){
+           print(" | %20s".format(c1))
+        }
+        println(" |")
+        for(c1 <- NumCol){
+           print("%20s".format(c1))
+           for(c2 <- NumCol){
+              print("%+20.5f".format(input.stat.corr(c1, c2) ))
+           }
+           println(" |")
+        }
+   }
+
+
+  def main(args: Array[String]) {
+
+        val sc = new SparkContext(new SparkConf().setAppName("ExpediaSQL"))
+        sc.setLogLevel("WARN")
+
+        val sqlContext = new org.apache.spark.sql.SQLContext(sc)
+        import sqlContext.implicits._
+
+
+        val schema = StructType( Array(
+           StructField("id", IntegerType, true),
+           StructField("date_time", StringType, true),
+           StructField("site_name", IntegerType, true),
+           StructField("posa_continent", IntegerType, true),
+           StructField("user_location_country", IntegerType, true),
+           StructField("user_location_region", IntegerType, true),
+           StructField("user_location_city", IntegerType, true),
+           StructField("orig_destination_distance", DoubleType, true),
+           StructField("user_id", IntegerType, true),
+           StructField("is_mobile", IntegerType, true),
+           StructField("is_package", IntegerType, true),
+           StructField("channel", IntegerType, true),
+           StructField("srch_ci", StringType, true),
+           StructField("srch_co", StringType, true),
+           StructField("srch_adults_cnt", IntegerType, true),
+           StructField("srch_children_cnt", IntegerType, true),
+           StructField("srch_rm_cnt", IntegerType, true),
+           StructField("srch_destination_id", IntegerType, true),
+           StructField("srch_destination_type_id", IntegerType, true),
+           StructField("is_booking", IntegerType, true),
+           StructField("cnt", IntegerType, true),
+           StructField("hotel_continent", IntegerType, true),
+           StructField("hotel_country", IntegerType, true),
+           StructField("hotel_market", IntegerType, true),
+           StructField("hotel_cluster", IntegerType, true)
+        ))
+
+        //Register UDF
+        sqlContext.udf.register("getNDays", getNDays _)
+
+
+ 	//Loading the train data into RDD with split
+	val trainDataRowRDD =sc.textFile("file:///afs/cern.ch/user/q/querten/scratch0/train.csv.gz").filter(! _.contains("date_time") ).map(_.split(",")).map( a => {
+           var distance:Double = -1.0
+           if(a(6).length>0)distance=a(6).toDouble
+           Row(-1, a(0),a(1).toInt,a(2).toInt,a(3).toInt,a(4).toInt,a(5).toInt,distance,a(7).toInt,a(8).toInt,a(9).toInt,a(10).toInt,a(11),a(12), a(13).toInt, a(14).toInt, a(15).toInt, a(16).toInt, a(17).toInt, a(18).toInt, a(19).toInt, a(20).toInt, a(21).toInt, a(22).toInt, a(23).toInt )
+        }).sample(true, 1.0)
+        val trainDF = sqlContext.createDataFrame(trainDataRowRDD, schema)
+        trainDF.registerTempTable("trainDF")
+
+ 	//Loading the test data into RDD with split
+	val testDataRowRDD =sc.textFile("file:///afs/cern.ch/user/q/querten/scratch0/test.csv.gz").filter(! _.contains("date_time") ).map(_.split(",")).map( a => {
+           var distance:Double = -1.0
+           if(a(7).length>0)distance=a(7).toDouble
+           Row(a(0).toInt, a(1),a(2).toInt,a(3).toInt,a(4).toInt,a(5).toInt,a(6).toInt,distance,a(8).toInt,a(9).toInt,a(10).toInt,a(11).toInt,a(12),a(13), a(14).toInt, a(15).toInt, a(16).toInt, a(17).toInt, a(18).toInt, 1, -1, a(19).toInt, a(20).toInt, a(21).toInt, -1 )
+        }).sample(true, 1.0)
+        val testDF = sqlContext.createDataFrame(testDataRowRDD, schema)
+        testDF.registerTempTable("testDF")
+
+
+////        sqlContext.sql("SELECT srch_adults_cnt, srch_children_cnt, srch_rm_cnt, count(date_time) AS count FROM trainDF GROUP BY srch_adults_cnt, srch_children_cnt, srch_rm_cnt ORDER BY count DESC LIMIT 25").show(25)
+////        sqlContext.sql("SELECT getNDays(srch_ci, srch_co) AS nday, count(date_time) AS count FROM trainDF GROUP BY getNDays(srch_ci, srch_co) ORDER BY count DESC LIMIT 25").show(25)
+////        sqlContext.sql("SELECT user_location_country,user_location_region,user_location_city, count(date_time) AS count FROM trainDF GROUP BY user_location_country,user_location_region,user_location_city ORDER BY count DESC LIMIT 25").show(25)
+////        sqlContext.sql("SELECT user_id, count(date_time) AS count FROM trainDF GROUP BY user_id ORDER BY count DESC LIMIT 25").show(25)
+
+
+////        sqlContext.sql("SELECT hotel_cluster, AVG(srch_adults_cnt) as srch_adults_cnt, AVG(srch_children_cnt) as srch_children_cnt, AVG(srch_rm_cnt) as srch_rm_cnt, COUNT(date_time) as NEntry FROM trainDF GROUP BY hotel_cluster ORDER BY hotel_cluster ASC LIMIT 25").show(25)
+////        sqlContext.sql("SELECT * FROM trainDF WHERE hotel_cluster=0 AND is_booking=1 LIMIT 50").show(50)
+
+
+////        val dataDF = sqlContext.sql("SELECT *, getNDays(srch_ci, srch_co) AS nday, CAST(hotel_cluster=0 AS DOUBLE) AS label0  FROM trainDF WHERE is_booking=1")
+////        val dataDF = sqlContext.sql("SELECT user_location_country, user_location_region, user_location_city, hotel_cluster,  count(date_time) AS count, avg(orig_destination_distance) AS distMean, stddev(orig_destination_distance) AS distSigma FROM trainDF WHERE is_booking=1 and orig_destination_distance>-1  GROUP BY user_location_country,user_location_region,user_location_city,hotel_cluster ORDER BY user_location_country,user_location_region,user_location_city,hotel_cluster DESC LIMIT 500  ").show(500)
+
+
+
+     val trainDFgrouped = sqlContext.sql("SELECT user_location_country, user_location_region, user_location_city, hotel_cluster,  count(date_time) AS count, avg( orig_destination_distance) AS distMean, stddev( orig_destination_distance ) AS distSigma FROM trainDF WHERE is_booking=1 GROUP BY user_location_country, user_location_region, user_location_city,hotel_cluster")
+     trainDFgrouped.cache()
+     val traindDFgroupedBD = sc.broadcast(trainDFgrouped)
+     trainDFgrouped.registerTempTable("trainDFgrouped")
+     
+    
+
+    val totalstartTime = System.nanoTime()
+    val finalPrediction = testDF.sample(true, 0.01).map(col => (col(0), col(4), col(5), col(6),col.getDouble(7) ) ).collect().par.map ( t => {
+       val TmpDF = traindDFgroupedBD.value
+          .where("user_location_country="+t._2+" and user_location_region="+t._3+" and user_location_city="+t._4)
+          .withColumn("distMeanDiff", abs($"distMean" - t._5) )
+          .select("distMeanDiff", "hotel_cluster", "count")
+
+       val LeakArray = {
+          if(t._5>=0){
+              TmpDF
+              .where("distMeanDiff<0.5")
+              .sort($"distMeanDiff".asc)
+              .select("hotel_cluster")
+              .map(_.getInt(0))
+              .take(1)
+           }else{
+              Array[Int]()
+           }
+       }
+
+       val Top5Array = 
+              {if(LeakArray.size>0){ TmpDF.where("hotel_cluster!=" + LeakArray(0))}else{ TmpDF }}
+              .sort($"count".desc)
+              .select("hotel_cluster")
+              .map(_.getInt(0))
+              .take(5 - LeakArray.size)
+
+       (t._1, (LeakArray++Top5Array).toList )
+    })
+    finalPrediction.foreach(println)
+    val totalelapsedTime = (System.nanoTime() - totalstartTime) / 1e9
+    println(s"TOTAL time: $totalelapsedTime seconds")
+
+
+    System.out.println("All Done")
+
+
+  }
+}

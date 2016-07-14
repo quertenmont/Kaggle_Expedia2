@@ -1,0 +1,288 @@
+package lq
+
+
+//import scala._
+import scala.Predef._
+import scala.reflect.runtime.universe.TypeTag
+import scala.reflect.runtime.universe.TypeTag._
+import scala.collection.mutable.ArrayBuffer
+
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkContext._
+import org.apache.spark.SparkConf
+import org.apache.spark.sql._
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.functions.udf
+
+import org.apache.spark.mllib.linalg._
+import org.apache.spark.mllib.clustering._
+import org.apache.spark.mllib.random._
+import org.apache.spark.mllib.random.RandomRDDs
+import org.apache.spark.mllib.tree._
+import org.apache.spark.mllib.tree.model._
+import org.apache.spark.mllib.tree.configuration.{Strategy, Algo}
+import org.apache.spark.mllib.tree.impurity.{Gini, Variance}
+import org.apache.spark.mllib.util.MLUtils
+import org.apache.spark.mllib.regression._
+import org.apache.spark.mllib.evaluation._
+
+import java.lang._ 
+import java.lang.Math
+import java.util.Date;
+import java.text.SimpleDateFormat
+import java.util.concurrent.TimeUnit
+
+
+/*
+date_time Timestamp string 
+site_name ID of the Expedia point of sale (i.e. Expedia.com, Expedia.co.uk, Expedia.co.jp, ...) int 
+posa_continent ID of continent associated with site_name int 
+user_location_country The ID of the country the customer is located int 
+user_location_region The ID of the region the customer is located int 
+user_location_city The ID of the city the customer is located int 
+orig_destination_distance Physical distance between a hotel and a customer at the time of search. A null means the distance could not be calculated double 
+user_id ID of user int 
+is_mobile 1 when a user connected from a mobile device, 0 otherwise tinyint 
+is_package 1 if the click/booking was generated as a part of a package (i.e. combined with a flight), 0 otherwise int 
+channel ID of a marketing channel int 
+srch_ci Checkin date string 
+srch_co Checkout date string 
+srch_adults_cnt The number of adults specified in the hotel room int 
+srch_children_cnt The number of (extra occupancy) children specified in the hotel room int 
+srch_rm_cnt The number of hotel rooms specified in the search int 
+srch_destination_id ID of the destination where the hotel search was performed int 
+srch_destination_type_id Type of destination int 
+is_booking 1 if a booking, 0 if a click tinyint 
+cnt Numer of similar events in the context of the same user session bigint 
+hotel_continent Hotel continent int 
+hotel_country Hotel country int 
+hotel_market Hotel market int 
+hotel_cluster ID of a hotel cluster int 
+*/
+
+
+
+object Expedia {
+
+def getyear(s:String):String = {
+   val year = s.substring(s.lastIndexOf('/')+1)
+   year
+}
+
+def getNDays(ci:String, co:String):Int = {
+   try{
+      val formatter = new SimpleDateFormat("yyyy-MM-dd");
+      var dateCI = formatter.parse(ci);
+      var dateCO = formatter.parse(co);
+      return TimeUnit.DAYS.convert(dateCO.getTime()-dateCI.getTime(), TimeUnit.MILLISECONDS).toInt
+   }catch{
+      case unknown : Throwable => return -99
+   }
+}
+
+  case class userLocClass(user_location_country:Int , user_location_region:Int , user_location_city:Int)
+  case class hotelLocClass(hotel_continent:Int , hotel_country:Int , hotel_market:Int)
+
+  case class trainClass(date_time:String , site_name:Int , posa_continent:Int , user_location:userLocClass , orig_destination_distance:Double , user_id:Int , is_mobile:Int , is_package:Int , channel:Int , srch_ci:String , srch_co:String , srch_adults_cnt:Int , srch_children_cnt:Int , srch_rm_cnt:Int , srch_destination_id:Int , srch_destination_type_id:Int , is_booking:Int , cnt:Int , hotelLoc:hotelLocClass , hotel_cluster:Int)
+
+  //simple functio which prints all the stat
+  def printStat(sqlContext:org.apache.spark.sql.SQLContext, input:org.apache.spark.sql.DataFrame, table:String){
+      input.describe().show() //take quite some time
+      sqlContext.sql("SELECT orig_destination_distance FROM " + table + " WHERE orig_destination_distance>=0").describe().show()
+      //input.select(mean("posa_continent"), min("posa_continent"), max("posa_continent")).show()
+
+  }
+
+  def printCorrMatrix(sqlContext:org.apache.spark.sql.SQLContext, input:org.apache.spark.sql.DataFrame){
+        val ColType = input.dtypes
+        ColType.foreach(println)
+        val NumCol = ArrayBuffer[String]()
+        for(ct <- ColType){
+           println(ct)
+           if(! ct._2.contains("String")){
+              NumCol+= ct._1 
+           }           
+        }
+        NumCol.foreach(println)
+
+        print("%20s".format("Header"))
+        for(c1 <- NumCol){
+           print(" | %20s".format(c1))
+        }
+        println(" |")
+        for(c1 <- NumCol){
+           print("%20s".format(c1))
+           for(c2 <- NumCol){
+              print("%+20.5f".format(input.stat.corr(c1, c2) ))
+           }
+           println(" |")
+        }
+   }
+
+
+  def main(args: Array[String]) {
+        val OutputDirectory:String = args(0)
+        val TargetHotelClusters:Array[String] = args.slice(1,args.size)
+
+        val sc = new SparkContext(new SparkConf().setAppName("Expedia"))
+        val sqlContext = new org.apache.spark.sql.SQLContext(sc)
+        import sqlContext.implicits._
+
+
+ 	//Loading the data into RDD with split
+	val trainData =sc.textFile("file:///afs/cern.ch/user/q/querten/workspace/public/SparkTest/Data/train.csv",300).map(_.split(",")).filter(! _(0).contains("date_time") ).map(a=>{
+           var distance:Double = -1.0
+           if(a(6).length>0)distance=a(6).toDouble
+           trainClass(a(0),a(1).toInt,a(2).toInt,userLocClass(a(3).toInt,a(4).toInt,a(5).toInt),distance,a(7).toInt,a(8).toInt,a(9).toInt,a(10).toInt,a(11),a(12), a(13).toInt, a(14).toInt, a(15).toInt, a(16).toInt, a(17).toInt, a(18).toInt, a(19).toInt, hotelLocClass(a(20).toInt, a(21).toInt, a(22).toInt), a(23).toInt )
+        }).sample(true, 1.0).cache()
+
+        val indexMapposa_continent = sc.broadcast(getCatMap(trainData.map(a => a.posa_continent)))
+        val indexMapUserLoc        = sc.broadcast(getCatMap(trainData.map(a => a.user_location.user_location_country)))
+        val indexMapChannel        = sc.broadcast(getCatMap(trainData.map(a => a.channel)))
+        val indexMapDestType       = sc.broadcast(getCatMap(trainData.map(a => a.srch_destination_type_id)))
+        val indexMapHotelCountry   = sc.broadcast(getCatMap(trainData.map(a => a.hotelLoc.hotel_country)))
+        val indexMapHotelMarket    = sc.broadcast(getCatMap(trainData.map(a => a.hotelLoc.hotel_market), 256))
+
+        TargetHotelClusters.foreach(TargetHotelClusterString => {
+           val TargetHotelCluster:Int = TargetHotelClusterString.toInt
+
+           val simpleDataset = trainData.map(a => LabeledPoint( 
+               { if(a.hotel_cluster==TargetHotelCluster) 1.0  else 0.0;},
+               Vectors.dense(
+                  getNDays(a.srch_ci, a.srch_co), 
+                  indexMapposa_continent.value(a.posa_continent), 
+                  indexMapUserLoc.value(a.user_location.user_location_country), 
+                  a.orig_destination_distance, 
+                  a.is_mobile, 
+                  a.is_package, 
+                  indexMapChannel.value(a.channel), 
+                  a.srch_adults_cnt, 
+                  a.srch_children_cnt, 
+                  a.srch_rm_cnt, 
+                  indexMapDestType.value(a.srch_destination_type_id),
+                  indexMapHotelCountry.value(a.hotelLoc.hotel_country),
+                  indexMapHotelMarket.value(a.hotelLoc.hotel_market))
+               ) 
+           ).randomSplit(Array(0.25, 0.25, 0.25, 0.25))
+
+     // Train a RandomForest model.
+     // Empty categoricalFeaturesInfo indicates all features are continuous.
+     val categoricalFeaturesInfo = Map[Int, Int](  //FIXME index and number of category
+        (1 -> indexMapposa_continent.value.size),  //posa_continent
+        (2 -> indexMapUserLoc.value.size),  //posa_continent
+        (4 -> 2),  //is_mobile
+        (5 -> 2),  //is_package
+        (6 -> indexMapChannel.value.size),  //channel
+        (10 -> indexMapDestType.value.size), //destination_type
+        (11 -> indexMapHotelCountry.value.size), //hotel country
+        (12 -> math.min(indexMapHotelMarket.value.size, 256)) //hotel market  //size is forced by hand
+     )
+     println(categoricalFeaturesInfo.toString)
+
+     val featureSubsetStrategy = "auto" // Let the algorithm choose.
+     val strategy = new Strategy(algo = Algo.Classification, impurity = Gini, maxDepth = 7, numClasses = 100, categoricalFeaturesInfo = categoricalFeaturesInfo,  useNodeIdCache = true, maxBins = 256) 
+     val numTrees = 25
+
+     //val allTrees = ArrayBuffer[DecisionTreeModel]()
+     val allModels = ArrayBuffer[RandomForestModel]()
+
+     simpleDataset.zipWithIndex.foreach( a => {
+        val trainDataset = a._1
+        val trainingSampleId = a._2
+        trainDataset.cache()
+   //  for( trainingSampleId <- 0 until 4){
+   //       val trainDataset  = simpleDataset(trainingSampleId).cache()
+
+          // Fit the model
+          val startTime = System.nanoTime()
+          val treeModel = RandomForest.trainClassifier(trainDataset, strategy, numTrees, featureSubsetStrategy, 1234)
+          val elapsedTime = (System.nanoTime() - startTime) / 1e9
+          println(s"Training time: $elapsedTime seconds")
+          
+          allModels += treeModel;
+          treeModel.save(sc, "file://"+OutputDirectory+"/HotelCLuster"+TargetHotelCluster.toString+"_TrainSet"+trainingSampleId.toInt)
+
+          //allTrees ++= treeModel.trees  //not used
+     })
+
+     //test using the first sample
+     val testDataset   = simpleDataset(1).cache()
+     val labelAndPreds = testDataset.map { point => (allModels(0).predict(point.features) , point.label ) }
+     //evaluatePerformances(labelAndPreds)
+     val testErr = labelAndPreds.filter(r => r._1 != r._2).count.toDouble / labelAndPreds.count()
+     val PP = labelAndPreds.filter(r => r._2>0.5).count().toDouble
+     val TP = labelAndPreds.filter(r => r._2 == 1 && r._1 == r._2).count.toDouble
+     println("Classification of hotel cluster %3d against all others: Purity = %7.4f Error = %7.4f  TruePositive = %7.4f/%7.4f = %7.4f".format(TargetHotelCluster, 1.0-testErr, testErr, TP, PP, TP/PP))
+
+   })
+
+
+
+//  val trees = sc.broadcast(allTrees)
+//  testDataset.map { point => 
+//     val Top5probs = trees.value.map( tree => (tree.predict(point.features), 1.0/numTrees) ).reduceByKey(_+_).map(x => (x._2, x._1)).top(5).map(x => (x._2, x._1))
+//     val Top5probs = trees.value.map( tree => tree.predict(point.features) ).groupBy(x => x).map(x => (x._1, x._2.size.toDouble/numTrees) ).toSeq.sortWith(_._2 > _._2).take(5)
+//     ((point.features,  point.label), Top5probs)
+//  }.take(25).foreach(a => println(a._1.toString + " --> " + a._2.mkString(" | ") ))
+
+
+    sc.stop()
+    System.out.println("All Done")
+  }
+
+
+/*
+  def evaluatePerformances(predictionAndLabels:org.apache.spark.rdd.RDD[(scala.Double, scala.Double)]){
+      // Instantiate metrics object
+      val metrics = new MulticlassMetrics(predictionAndLabels)
+
+      // Confusion matrix
+      println("Confusion matrix:")
+      println(metrics.confusionMatrix)
+
+      // Overall Statistics
+      val precision = metrics.precision
+      val recall = metrics.recall // same as true positive rate
+      val f1Score = metrics.fMeasure
+      println("Summary Statistics")
+      println(s"Precision = $precision")
+      println(s"Recall = $recall")
+      println(s"F1 Score = $f1Score")
+
+      // Precision by label
+      val labels = metrics.labels
+      labels.foreach { l =>
+        println(s"Precision($l) = " + metrics.precision(l))
+      }
+
+      // Recall by label
+      labels.foreach { l =>
+        println(s"Recall($l) = " + metrics.recall(l))
+      }
+
+      // False positive rate by label
+      labels.foreach { l =>
+        println(s"FPR($l) = " + metrics.falsePositiveRate(l))
+      }
+
+      // F-measure by label
+      labels.foreach { l =>
+        println(s"F1-Score($l) = " + metrics.fMeasure(l))
+      }
+
+      // Weighted stats
+      println(s"Weighted precision: ${metrics.weightedPrecision}")
+      println(s"Weighted recall: ${metrics.weightedRecall}")
+      println(s"Weighted F1 score: ${metrics.weightedFMeasure}")
+      println(s"Weighted false positive rate: ${metrics.weightedFalsePositiveRate}")
+  }
+*/
+  def getNCat( trainDataset:org.apache.spark.rdd.RDD[LabeledPoint], index:Int ):Int = {
+     trainDataset.map(point => point.features(index)).distinct.count.toInt
+  }
+
+  def getCatMap( dataRDD:org.apache.spark.rdd.RDD[Int], maxCat:Int = 9999):scala.collection.Map[Int,Int] = {
+     dataRDD.map(data => (data, 1)).reduceByKey(_+_).map(a => (a._2,a._1)).sortByKey(false).map(a => a._2).zipWithIndex().map(a => (a._1, math.min(maxCat-1,a._2.toInt).toInt)).collectAsMap()
+  }
+
+}

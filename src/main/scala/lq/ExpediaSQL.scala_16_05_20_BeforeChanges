@@ -1,0 +1,498 @@
+package lq
+
+import java.lang._ 
+import scala.reflect.runtime.universe.TypeTag
+import scala.reflect.runtime.universe.TypeTag._
+import scala.collection.mutable.ArrayBuffer
+import scala.concurrent.duration._
+import scala.concurrent._
+//import Numeric.Implicits._
+//import Ordering.Implicits._
+
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkContext._
+import org.apache.spark.SparkConf
+import org.apache.spark.sql._
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.expressions.Window
+//import org.apache.spark.sql.hive.HiveContext
+
+import org.apache.spark.ml.classification.{OneVsRest, LogisticRegression}
+import org.apache.spark.ml.param.ParamMap
+import org.apache.spark.mllib.linalg._
+import org.apache.spark.mllib.clustering._
+import org.apache.spark.mllib.random._
+
+import org.apache.spark.ml._
+import org.apache.spark.ml.classification._
+import org.apache.spark.ml.feature._
+import org.apache.spark.ml.evaluation._
+
+import java.lang.Math
+import java.text.SimpleDateFormat
+import java.util.concurrent.TimeUnit
+import java.util.{Calendar, Date}
+
+import smile.classification._
+import smile.data.{Attribute, NumericAttribute, NominalAttribute};
+
+object ExpediaSQL {
+
+   def getdateunit(s:String):Double = {
+      val formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+      var date = formatter.parse(s);
+      val calendar = Calendar.getInstance();
+      calendar.setTime(date);
+      ((calendar.get(Calendar.DAY_OF_YEAR).toDouble / 365) + (calendar.get(Calendar.YEAR) - 2013).toDouble)/3.0;   //divide by 3 to be in [0-1] for date from 2013 till 2015
+   }
+
+
+   def getyear(s:String):Int = {
+      val formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+      var date = formatter.parse(s);
+      val calendar = Calendar.getInstance();
+      calendar.setTime(date);
+      calendar.get(Calendar.YEAR) % 100;
+   }
+
+   def getmonth(s:String):Int = {
+      val formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+      var date = formatter.parse(s);
+      val calendar = Calendar.getInstance();
+      calendar.setTime(date);
+      calendar.get(Calendar.MONTH );
+   }
+
+   def getmonthunit(s:String):Double = {
+      val formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+      var date = formatter.parse(s);
+      val calendar = Calendar.getInstance();
+      calendar.setTime(date);
+      calendar.get(Calendar.DAY_OF_YEAR).toDouble / 365;
+   }
+
+   def getNDays(ci:String, co:String):Int = {
+      try{
+         val formatter = new SimpleDateFormat("yyyy-MM-dd");
+         var dateCI = formatter.parse(ci);
+         var dateCO = formatter.parse(co);
+         return TimeUnit.DAYS.convert(dateCO.getTime()-dateCI.getTime(), TimeUnit.MILLISECONDS).toInt
+      }catch{
+         case unknown : Throwable => return -99
+      }
+   }
+
+  case class user_location(country:Int , region:Int , city:Int)
+  case class hotel_location(continent:Int , country:Int , market:Int);
+  case class cico_date(ci:String , co:String)
+  case class querry(id:Long, date_time:String , site_name:Int , posa_continent:Int , user:user_location, orig_destination_distance:Int , user_id:Int , is_mobile:Int , is_package:Int , channel:Int , date:cico_date, srch_adults_cnt:Int , srch_children_cnt:Int , srch_rm_cnt:Int , srch_destination_id:Int , srch_destination_type_id:Int , is_booking:Int , cnt:Int , hotel:hotel_location, hotel_cluster:Int)
+  case class result(q:querry, p:Seq[(Int,Any)])
+
+
+  def Map5(EvaluatePerf:Boolean, label:String, results:org.apache.spark.rdd.RDD[result]):org.apache.spark.rdd.RDD[result] = {
+       if(EvaluatePerf){
+          val out = results.map( r => {
+             Array[scala.Double](1 , r.p.view.zipWithIndex.map( p => if(p._1._1==r.q.hotel_cluster){1.toDouble/(p._2+1.0)}else{0.0} ).foldLeft(0.toDouble)(Math.max) )
+          }).reduce( (a,b) => a.zip(b).map( pair => pair._1+pair._2) )
+          println("Performance for %15s with MAP@5 = %8f/%8f = %8.4f".format(label, out(1), out(0), out(1)/out(0)) )
+       }
+//       println("LISTING RESULTS FOR " + label)
+//       results.filter(_.q.id<10).take(10).sortBy(_.q.id).foreach(println)
+       results
+  }
+
+//  def append_0(q:querry):java.lang.Double = { ((getyear(q.date_time) - 12)*12 + (getmonth(q.date_time) - 12)) }  //FIXME original
+//  def append_1(q:querry):java.lang.Double = { append_0(q) * append_0(q) * (3 + 17.60* q.is_booking.toDouble) }
+//  def append_2(q:querry):java.lang.Double = { 3 + 5.56* q.is_booking.toDouble }
+
+  def append_0(q:querry):java.lang.Double = { (getyear(q.date_time) - 12)*12 + getmonthunit(q.date_time)-12 }  //FIXME original
+  def append_1(q:querry):java.lang.Double = { math.pow(append_0(q),2) * (3 + 17.60* q.is_booking.toDouble) }
+  def append_2(q:querry):java.lang.Double = { (3 + 5.56* q.is_booking.toDouble) }
+
+  def main(args: Array[String]) {
+        val conf = new SparkConf()
+        conf.setAppName("ExpediaSQL")
+        conf.set("spark.driver.memory", "4g")
+        conf.set("spark.executor.memory", "4g")
+        conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer") //to avoid serialization issues with smile
+//        conf.set("spark.kryoserializer.buffer.mb", "256"); 
+        conf.set("spark.kryoserializer.buffer.max", "256mb");
+        val sc = new SparkContext(conf)
+        sc.setLogLevel("WARN")
+
+        val sqlContext = new org.apache.spark.sql.SQLContext(sc)
+        import sqlContext.implicits._
+
+
+        //OPTIONS
+        val EvaluatePerf = false;
+        val useMVA       = true;
+        val CamiloMPA5   = true
+
+        var trainFile = "file:///afs/cern.ch/user/q/querten/workspace/public/SparkTest/Data/train.csv"
+        var testFile  = "file:///afs/cern.ch/user/q/querten/scratch0/test.csv"
+
+        if(CamiloMPA5){
+            trainFile = "file:///afs/cern.ch/user/q/querten/workspace/public/SparkTest/check_score/train20132014I.csv"
+            testFile  = "file:///afs/cern.ch/user/q/querten/workspace/public/SparkTest/check_score/test_2014II_isbooking.csv"
+        }
+
+
+ 	//Loading the train data into RDD with split
+	val inputTrainDataRowRDD =sc.textFile(trainFile, 300).filter(! _.contains("date_time") ).map(_.split(",")).zipWithIndex().map{ case(q,index) => 
+           var distance:Int = {if(q(6).length>0){(q(6).toDouble*1E5).toInt}else{-1} }
+           querry(-1*index, q(0),q(1).toInt,q(2).toInt, user_location(q(3).toInt,q(4).toInt,q(5).toInt),distance,q(7).toInt,q(8).toInt,q(9).toInt,q(10).toInt, cico_date(q(11),q(12)),
+                  q(13).toInt, q(14).toInt, q(15).toInt, q(16).toInt, q(17).toInt, q(18).toInt, q(19).toInt, hotel_location(q(20).toInt, q(21).toInt, q(22).toInt), q(23).toInt )
+        }
+
+ 	//Loading the test data into RDD with split
+	val inputTestDataRowRDD =sc.textFile(testFile).filter(! _.contains("date_time") ).map(_.split(",")).map{ q =>
+           var distance:Int = {if(q(7).length>0){(q(7).toDouble*1E5).toInt}else{-1} }
+           querry(q(0).toLong, q(1),q(2).toInt,q(3).toInt,user_location(q(4).toInt,q(5).toInt,q(6).toInt),distance,q(8).toInt,q(9).toInt,q(10).toInt,q(11).toInt,cico_date(q(12),q(13)), 
+                  q(14).toInt, q(15).toInt, q(16).toInt, q(17).toInt, q(18).toInt, 1, 1, hotel_location(q(19).toInt, q(20).toInt, q(21).toInt), -1 )
+        }
+        //.filter( q => q.id<10) //FIXME
+        
+        //define the training and test samples that we are going to use
+        val Array(trainDataRowRDD, testDataRowRDD) = {
+           if(EvaluatePerf){
+              Array(inputTrainDataRowRDD.filter(q => getyear(q.date_time)<14 || getmonthunit(q.date_time)<0.5), inputTrainDataRowRDD.filter(q => getyear(q.date_time)==14 && getmonthunit(q.date_time)>0.5 && q.is_booking==1 && q.cnt==1 ) )
+           }else{
+              Array(inputTrainDataRowRDD, inputTestDataRowRDD )
+           }
+        }.map(_.cache())
+
+
+        //Init : DEFINE THE OUTPUT FORMAT AND USE IT EVERYWHERE  (ALLOWS to comment some part of the code without hurts)
+        val totalstartTime = System.nanoTime()
+        var results = testDataRowRDD.map(q => result(q, Seq[(Int,Int)]()) );
+
+        //get the most frequent clusters overall  (will be use for sorting in case of equality)
+
+        val clusterFrequency =  trainDataRowRDD                                                          //WILL BE  PairRDD[cluster]
+           .map(q => ( q.hotel_cluster, append_0(q) )  )                                   //group by cluster
+           .reduceByKey(_+_)                                                                                      //count per cluster
+           .sortBy(_._2, false)                                                                                   //order the list (descending)
+           
+        val clusterFrequencyBD=  sc.broadcast(
+           clusterFrequency.collect.toMap
+        )
+
+        //Step a) : MAKE PREDICTION BASED ON DISTANCE DATA LEAK
+        //a1) make a map of top clusters and Classifier for each leak entry
+        val groupedLeakClassifier = trainDataRowRDD
+        .filter(q => q.orig_destination_distance >=0 )
+        .map(q => ( (q.user.city, q.orig_destination_distance) , q)  )
+        .groupByKey().mapValues( Querries => {
+           val hotelClustersOrdered = Querries.map(q => {  (q.hotel_cluster, append_0(q)) })
+                                      .groupBy(_._1)
+                                      .map({ pair => pair._2.reduce{(a,b) => (a._1, a._2 + b._2)} })
+                                      .toSeq.sortWith{ case(a,b) =>  if( a._2 != b._2  ){a._2 > b._2}else{ clusterFrequencyBD.value(a._1) > clusterFrequencyBD.value(b._1) }  }
+//                                      .map(a=>a._1)
+           val hotelClustersMap     = hotelClustersOrdered.zipWithIndex.toMap
+           val classifier = null
+           (hotelClustersOrdered.toSeq, classifier)
+        })
+
+        //Step a2)  use the previously created map to make the prediction
+        results = results
+        .map(r => ( (r.q.user.city, r.q.orig_destination_distance ), r)  )
+        .cogroup(groupedLeakClassifier)
+        .flatMap{ case(key, value ) => val test = value._1; val leak = value._2;
+
+           if(key._2>=0 && leak.size>0){                                                                       //make sure we have a leak AND the distance is >0 
+              val leakClusters   = leak.head._1
+              val leakClassifier = leak.head._2
+                 test.map(r => result(r.q, (r.p ++ leakClusters).distinct.take(5) ) ) 
+           }else{ 
+              test 
+           }
+        }
+        Map5(EvaluatePerf,  "UserLoc, Dist", results)
+
+///////////////////////////////////////////////////////////////////////////////
+
+
+
+        //Step a Bis : MAKE A PREDICTION BASED ON PAST HOTEL VISITED BY THE SAME USER when there is no orig_destination_distance
+        val pasUserDebugD = trainDataRowRDD
+        .filter(q => q.is_booking==1 )  //do this only if we don't have distance match and we have a booking
+        .flatMap(q => { 
+           Seq( ( ({if(q.orig_destination_distance<0){0}else{1}}, q.user_id, q.user.city, q.srch_destination_id, q.hotel.country, q.hotel.market, q.hotel_cluster) , append_0(q) ) 
+              , ( ({if(q.orig_destination_distance<0){0}else{1}}, q.user_id, -1         , q.srch_destination_id, q.hotel.country, q.hotel.market, q.hotel_cluster) , append_0(q) ) )
+        })
+        .reduceByKey(_+_)                                                                                      //count per cluster
+        .map{ case (key, value) => ( (key._1, key._2, key._3, key._4, key._5, key._6), Seq( (key._7, value) ) ) }              //regroup by key / (cluster/value)
+        .reduceByKey((a,b) => a++b )                                                                           //sum-up the list for each group
+        .mapValues( a => a.sortWith{ case(a,b) =>  if( a._2 != b._2  ){a._2 > b._2}else{ clusterFrequencyBD.value(a._1) > clusterFrequencyBD.value(b._1) } }
+                         )// .map(_._1)  )                                          //collapste various clusters to a list
+        .map{ case (key, value) => ( (key._2, key._4, key._5, key._6), Map( ( (key._1, key._3) , value) )  ) } 
+        .reduceByKey((a,b) => (a++b) )
+
+//        println("debugD count = " + pasUserDebugD.count)
+//        pasUserDebugD.take(20).foreach(println)
+
+
+        //Step aTris 2)  use the previously created map to make the prediction
+        results = results
+        .map(r => ( (r.q.user_id, r.q.srch_destination_id, r.q.hotel.country, r.q.hotel.market), r)  )
+        .cogroup(pasUserDebugD)
+        .flatMap( in => {
+           val key = in._1
+           var test = in._2._1
+           val map  = in._2._2
+
+           if(map.size>0 ){                                                                       //make sure we have a matching entry in the map 
+              test.map(r => {
+                 var prediction = r.p
+                 if(r.q.orig_destination_distance<0){
+                     prediction = (prediction ++ map.head.getOrElse((0, r.q.user.city), Seq[(Int,Int)]())).distinct.take(5)
+                 }
+
+                 if(map.head.contains((1, -1)) && !map.head.contains((1, r.q.user.city))) prediction = (prediction ++ map.head.getOrElse((1,-1), Seq[(Int,Int)]())).distinct.take(5)
+
+                 result(r.q, prediction ) 
+              }) 
+           }else{ 
+              test 
+           }
+        })
+        Map5(EvaluatePerf,  "User,Dest,HotelLoc", results)
+
+        //Step b) : MAKE PREDICTION BASED ON MOST FREQUENT CLUSTER AT DESTINATION
+        //b1- get the most probable cluster per destinationId and country/market at once.  
+        val hotelLocRDD = trainDataRowRDD                                                                     //WILL BE  PairRDD[DestId , Map[Marker , Top5clusters]  ]
+        .flatMap(q => {                                                                                       //flat map to save two output entries per input entries, to work with destId/market/country and destId granularity
+           var toReturn = Seq( ((q.srch_destination_id, (-1,-1)                         ), q ) )
+//           if(getyear(q.date_time)==14){
+               toReturn = Seq( ((q.srch_destination_id, (q.hotel.country,q.hotel.market)), q ) ) ++ toReturn
+//           }
+           toReturn
+        }).groupByKey()
+        .map{ case(key, querries) => 
+            val hotelClustersOrdered = querries.map{ q =>
+               val weight = append_1(q)
+               (q.hotel_cluster,weight) 
+            }
+            .groupBy(_._1)
+            .map{ pair => pair._2.reduce{(a,b) => (a._1, a._2 + b._2)} }
+            .toSeq.sortWith{ case(a,b) =>  if( a._2 != b._2  ){a._2 > b._2}else{ clusterFrequencyBD.value(a._1) > clusterFrequencyBD.value(b._1) } }
+            //.map((a=>a._1)) 
+
+            var classifier = 
+            if(useMVA && hotelClustersOrdered.size>1 && querries.count(q => true)>50){
+              val hotelClustersMap     = hotelClustersOrdered.map((a=>a._1)).take(5).zipWithIndex.toMap  //only keep the 5 most likely clusters
+              val attributes = Array[Attribute]( new NumericAttribute("Date"), new NumericAttribute("BookingPeriod"), new NumericAttribute("DaysBeforeCheckin") )  
+              var labels   = ArrayBuffer[scala.Int]()
+              var features = ArrayBuffer[Array[scala.Double] ]()
+
+              querries.foreach{ q =>
+                 if(hotelClustersMap.contains(q.hotel_cluster)){ 
+                    labels += hotelClustersMap(q.hotel_cluster)
+                    features += Array( getdateunit(q.date_time).toDouble, getmonthunit(q.date_time).toDouble, getNDays(q.date_time, q.date.ci).toDouble )
+                 }
+              }
+              new RandomForest(attributes, features.toArray, labels.toArray, 10, 5, 5, 2, 1, DecisionTree.SplitRule.GINI) 
+           }else{
+              null
+           }
+
+           (key, (hotelClustersOrdered, classifier) )
+        }
+        .map{ case(key, value) => (key._1, Map(key._2 -> value) ) }               //regroup by DestId  //debugging modify value to (value, null)
+        .reduceByKey((a,b) => a++b )                                                                           //sum-up the list for each group
+
+        //b2) make the prediction
+        results = results
+        .map(r => ( r.q.srch_destination_id, r)  )
+        .cogroup(hotelLocRDD)
+        .flatMap{ case(key, value) => 
+           var test = value._1 //matching querry data
+           val lookup = value._2 //matching hotel location mapping best clusters
+
+           if(lookup.size>0){  //make sure this destId is in the lookup table
+              test.map(r => {
+                 var prediction = r.p
+                 val feature   = Array( getdateunit(r.q.date_time).toDouble, getmonthunit(r.q.date_time).toDouble, getNDays(r.q.date_time, r.q.date.ci).toDouble )
+
+//FIXME
+
+                 val highGranularity = lookup.head.getOrElse((r.q.hotel.country,r.q.hotel.market), (Seq[(Int,Int)](),null))
+                 if (highGranularity._2==null || !useMVA){
+                     prediction = (prediction ++ highGranularity._1).distinct.take(5)
+                 }else{
+                     var posterior = Array.fill[scala.Double]( highGranularity._1.size)(0.0)
+                     highGranularity._2.predict(feature , posterior)
+                     prediction = (prediction ++ posterior.toSeq.zipWithIndex.sortWith(_._1 > _._1).map(pair => highGranularity._1(pair._2))).distinct.take(5)
+                 }
+
+//FIXME
+
+                 if(prediction.size<5){
+                 val lowGranularity = lookup.head.getOrElse((-1, -1), (Seq[(Int,Int)](),null))
+                 if (lowGranularity._2==null || !useMVA){
+                     prediction = (prediction ++ lowGranularity._1).distinct.take(5)
+                 }else{
+                     var posterior = Array.fill[scala.Double]( lowGranularity._1.size)(0.0)
+                     lowGranularity._2.predict(feature , posterior)
+                     prediction = (prediction ++ posterior.toSeq.zipWithIndex.sortWith(_._1 > _._1).map(pair => lowGranularity._1(pair._2)) ).distinct.take(5)
+                 }
+                 }
+
+                 result(r.q, prediction )
+              })
+           }else{ 
+              test 
+           }
+        }
+        Map5(EvaluatePerf,  "Destination Id, HotelLoc", results)
+
+
+//FIXME
+
+        //Step c) : MAKE PREDICTION BASED ON MOST FREQUENT CLUSTER AT DESTINATION COUNTRY
+        //c1) get the most probable cluster for this country
+        val hotelCountryRDD = trainDataRowRDD                                                                  //WILL BE  PairRDD[Country , Top5clusters  ]
+        .map(q => ( (q.hotel.country, q.hotel_cluster) , append_2(q))  )                                       //group by country/cluster
+        .reduceByKey(_+_)                                                                                      //count per group
+        .map( pair => {val key = pair._1; val value=pair._2; (key._1, Seq( (key._2, value) ) ) })              //regroup by country/market
+        .reduceByKey((a,b) => a++b )                                                                           //sum-up the list for each group
+        .mapValues( a => a.sortWith{  case(a,b) =>  if( a._2 != b._2  ){a._2 > b._2}else{ clusterFrequencyBD.value(a._1) > clusterFrequencyBD.value(b._1) } }
+                   )//       .map(_._1)  )                                                  //collapste various clusters to a list
+ 
+        //c2) make the prediction
+        results = results
+        .map(r => ( r.q.hotel.country, r)  )
+        .cogroup(hotelCountryRDD)
+        .flatMap{ case(key, value) => 
+           var test = value._1 //matching querry data
+           val lookup = value._2 //matching hotel location mapping best clusters
+
+           if(lookup.size>0){  //make sure this country is in the lookup table
+              test.map(r => result(r.q, (r.p ++ lookup.head).distinct.take(5) ) ) 
+           }else{ 
+              test 
+           }
+        }
+        Map5(EvaluatePerf,  "Hotel Country", results)
+
+//FIXME
+
+        //Step d) : MAKE PREDICTION BASED ON MOST FREQUENT CLUSTER WHERE EVER
+        val Top10HotelsWorldwide = clusterFrequency.take(10).toSeq//     .map(_._1).toSeq
+        results = results
+        .map(r => result(r.q, (r.p ++ Top10HotelsWorldwide).distinct.take(5) ) )
+        Map5(EvaluatePerf,  "Cluster Frequencies", results)
+
+
+
+/*
+    //some statistics
+    val stat = results.map(r => Array[Boolean]( r.p.size<=0,  r.p.size==1,  r.p.size==2,  r.p.size==3,  r.p.size==4,  r.p.size==5, r.p.size>5) )
+                      .map(r => r.map( b => if(b){1}else{0}) )
+                      .reduce( (a,b) => a.zip(b).map( pair => pair._1+pair._2) )
+
+    println("total test sample = " + stat.sum )
+    println("Test Id with less than 5 predictions = " + (stat.sum - stat(5) - stat(6)) )
+    println("Test Id with           0 predictions = " + stat(0) )
+    println("Test Id with           1 predictions = " + stat(1) )
+    println("Test Id with           2 predictions = " + stat(2) )
+    println("Test Id with           3 predictions = " + stat(3) )
+    println("Test Id with           4 predictions = " + stat(4) )
+    println("Test Id with           5 predictions = " + stat(5) )
+    println("Test Id with         > 5 predictions = " + stat(6) )
+*/
+
+    //Step FINAL): evaluate performance using map(5) function OR simply save the results for submission
+    Map5(EvaluatePerf, "Final", results)
+
+    if(!EvaluatePerf){
+       val submission = results .map{ r => r.q.id.toString + "," + r.p.map{case(cluster,count) => cluster}.mkString(" ") }
+       .coalesce(10)
+
+       submission.saveAsTextFile("file:///afs/cern.ch/user/q/querten/scratch0/Expedia_16_05_14");
+    }
+
+    val totalelapsedTime = (System.nanoTime() - totalstartTime) / 1e9
+    System.err.println(s"TOTAL time: $totalelapsedTime seconds")
+  }
+}
+
+
+/*
+         val x = Array(Array[scala.Double](1.0,0.0),Array[scala.Double](1.0, 0.0), Array[scala.Double](0.0,1.0), Array[scala.Double](0.0,1.0), Array[scala.Double](1.0,1.0))
+         val y = Array[scala.Int](0, 0, 1, 1, 2)
+         val Tree = new RandomForest(null, x, y, 10, 1, 1, 2, 1, DecisionTree.SplitRule.GINI)
+         println("Tree predicts : " + Tree.predict(Array[scala.Double](1.0,0.0) ) )
+         println("Tree predicts : " + Tree.predict(Array[scala.Double](0.0,1.0) ) )
+         println("Tree predicts : " + Tree.predict(Array[scala.Double](1.0,1.0) ) )
+         println("Tree predicts : " + Tree.predict(Array[scala.Double](0.0,0.0) ) )
+         println("Tree predicts : " + Tree.predict(Array[scala.Double](0.5,0.5) ) )
+         println("Tree predicts : " + Tree.predict(Array[scala.Double](2.0,2.0) ) )
+         var prob = Array[scala.Double](0.0, 0.0, 0.0)
+         println("Tree predicts : " + Tree.predict(Array[scala.Double](1.0,0.4) , prob) )
+         println("probabilities = " + prob.mkString(" | "))
+*/
+
+
+
+
+/*
+
+
+   //////////////////// PRELIMINARY WORK FOR MACHINE LEARNING STRATEGY
+    val statDestId =  trainDataRowRDD
+        .filter( q => getyear(q.date_time)==14)
+        .map(q => ( (q.srch_destination_id, q.hotel.country,q.hotel.market), Seq( q.hotel_cluster))  )
+        .reduceByKey((a,b) => (a++b).distinct )
+        .map(pair => Array[Boolean]( pair._2.size<=0,  pair._2.size==1,  pair._2.size==2,  pair._2.size==3,  pair._2.size==4,  pair._2.size==5, pair._2.size>5) )
+        .map(r => r.map( b => if(b){1}else{0}) )
+        .reduce( (a,b) => a.zip(b).map( pair => pair._1+pair._2) )
+
+    println("DestId total = " + statDestId.sum )
+    println("DestId with less than 5 Clusters = " + (statDestId.sum - statDestId(5) - statDestId(6)) )
+    println("DestId with           0 Clusters = " + statDestId(0) )
+    println("DestId with           1 Clusters = " + statDestId(1) )
+    println("DestId with           2 Clusters = " + statDestId(2) )
+    println("DestId with           3 Clusters = " + statDestId(3) )
+    println("DestId with           4 Clusters = " + statDestId(4) )
+    println("DestId with           5 Clusters = " + statDestId(5) )
+    println("DestId with         > 5 Clusters = " + statDestId(6) )
+
+
+   //////////////////// PRELIMINARY WORK FOR BETTER LEAK EXPLOITATION
+
+        val groupedLeakData = trainDataRowRDD
+        .filter(q => q.orig_destination_distance >=0 )
+        .map(q => ( (q.user.city, q.orig_destination_distance, getyear(q.date_time), q.hotel_cluster) , Seq(q))  )
+        .reduceByKey(_++_)
+        .map( case (key, value) => ((key._1, key._2, key._3) , Seq( (key._4, value) ) ) )
+        .reduceByKey((a,b) => a++b )
+        .mapValues( a => a.sortWith(_._2.size > _._2.size)  )
+
+        val statLeak = groupedLeakData
+        .map( case(key,value) => Array[Boolean]( value.size<=0,  value.size==1,  value.size==2,  value.size==3,  value.size==4,  value.size==5, value.size>5) )
+        .map(r => r.map( b => if(b){1}else{0}) )
+        .reduce( (a,b) => a.zip(b).map( pair => pair._1+pair._2) )
+
+          println("Leak total = " + statLeak.sum )
+          println("Leak with less than 5 Clusters = " + (statLeak.sum - statLeak(5) - statLeak(6)) )
+          println("Leak with           0 Clusters = " + statLeak(0) )
+          println("Leak with           1 Clusters = " + statLeak(1) )
+          println("Leak with           2 Clusters = " + statLeak(2) )
+          println("Leak with           3 Clusters = " + statLeak(3) )
+          println("Leak with           4 Clusters = " + statLeak(4) )
+          println("Leak with           5 Clusters = " + statLeak(5) )
+          println("Leak with         > 5 Clusters = " + statLeak(6) )
+
+
+        groupedLeakData
+        .filter(a => a._2.size>1)
+        .take(25).foreach(pair => {println("### " + pair._1); pair._2.foreach(pair => { println("  ### HotelCluster = " + pair._1); pair._2.foreach(println); } )} )
+
+
+    /////////////////////////////////////////////////////////////////
+*/
+
+
